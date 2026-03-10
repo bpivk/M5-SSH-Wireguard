@@ -2,7 +2,6 @@
 
 A full-featured SSH client for the [M5Stack Cardputer](https://docs.m5stack.com/en/core/Cardputer) (ESP32-S3), with WireGuard VPN support, multi-profile management, and an ANSI terminal emulator — all in a single Arduino sketch.
 
-![M5Cardputer](https://static-cdn.m5stack.com/resource/docs/products/core/Cardputer/img-Cardputer-01.webp)
 
 ---
 
