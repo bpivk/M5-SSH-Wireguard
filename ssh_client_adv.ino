@@ -34,6 +34,7 @@
 #include <math.h>
 #include "libssh_esp32.h"
 #include <libssh/libssh.h>
+#include "lwip/sockets.h"
 
 // ── Display ────────────────────────────────────────────────────────────────────
 #define DW       240
@@ -42,8 +43,8 @@
 #define HINTH    12
 #define BODYY    (TITLEH + 2)
 #define BODYH    (DH - TITLEH - HINTH - 4)
-#define LH       18    // line height, text size 2
-#define LHS      10    // line height, text size 1
+#define LH       18
+#define LHS      10
 
 // ── Colours ───────────────────────────────────────────────────────────────────
 #define C_BG     TFT_BLACK
@@ -112,7 +113,7 @@ struct Settings {
     bool buzzer;
     int  defaultPort;
     bool autoConnect;
-    int  passDisplay;   // 0=hide all (****), 1=show last 3, 2=show all
+    int  passDisplay;   // 0=hide all, 1=show last 3, 2=show all
 };
 
 // ── Globals ────────────────────────────────────────────────────────────────────
@@ -121,54 +122,35 @@ int      g_profCnt  = 0;
 int      g_profSel  = 0;
 
 static WireGuard* g_wg = nullptr;
-static char g_wgFingerprint[128] = ""; // endpoint+pubkey of the running tunnel
-static bool g_wgTcpUsed = false;          // true once SSH has connected through this tunnel
+static char g_wgFingerprint[128] = "";
+static bool g_wgTcpUsed = false;       // set once SSH connects through WG; end() unsafe after
 
-// lwIP netif pointers saved around begin() — used to switch routing without end()
-// end() is unsafe after any TCP activity through the tunnel (crashes lwIP).
-// netif_set_default() is just a pointer swap — always safe.
 #include "lwip/netif.h"
+#include "lwip/tcpip.h"
 
-// RTC memory survives ESP.restart() — used for seamless WG config switching
-RTC_DATA_ATTR static int  g_bootProfileIdx = -1;  // profile to auto-connect after restart
-static struct netif* g_prevDefaultNetif = nullptr; // WiFi netif (saved before begin)
-static struct netif* g_wgNetif          = nullptr; // WG netif  (saved after  begin)
+RTC_DATA_ATTR static int  g_bootProfileIdx = -1;   // profile to auto-connect after WG restart
+static struct netif* g_prevDefaultNetif = nullptr;  // WiFi netif (saved before WG begin)
+static struct netif* g_wgNetif          = nullptr;  // WG netif  (saved after  WG begin)
 
-// Build a fingerprint to detect when WG config changes
 void wgFingerprint(const Profile& p, char* out, int sz) {
     snprintf(out, sz, "%s|%s", p.wg_endpoint, p.wg_pubkey);
 }
 
-// Suspend WG routing: restore WiFi as default route, leave WG netif registered.
-// Safe to call at any time — even after TCP has used the tunnel.
+// Restore WiFi as default route, leave WG netif registered but inactive.
 void wgSuspend() {
     if (g_prevDefaultNetif) {
+        LOCK_TCPIP_CORE();
         netif_set_default(g_prevDefaultNetif);
+        UNLOCK_TCPIP_CORE();
     }
 }
 
-// Resume WG routing: re-enable WG as default route (for same-profile reuse).
+// Re-enable WG as default route (same-config reuse).
 void wgResume() {
     if (g_wgNetif) {
+        LOCK_TCPIP_CORE();
         netif_set_default(g_wgNetif);
-    }
-}
-
-// Start a fresh WireGuard tunnel for profile p, storing fingerprint fp.
-// Returns false and shows error if config is invalid.
-// Caller must ensure g_wg == nullptr before calling.
-// Full WG teardown — only safe when begin() was NEVER called (g_wg==nullptr).
-// Once begin() has been called and TCP has touched the netif, do NOT call end().
-// Just clear our state and leave the lwIP netif registered (harmless if suspended).
-void wgClear() {
-    if (g_wg) {
-        // Do NOT call g_wg->end() — it calls netif_remove() which crashes after TCP use.
-        // The lwIP netif stays registered but inactive (not default route).
-        delete g_wg;
-        g_wg = nullptr;
-        g_wgFingerprint[0] = '\0';
-        g_wgNetif = nullptr;
-        // g_prevDefaultNetif intentionally kept so we can still call wgSuspend()
+        UNLOCK_TCPIP_CORE();
     }
 }
 
@@ -181,7 +163,6 @@ int      g_userCnt   = 0;
 
 Settings g_cfg = { 60, 0, 0, 128, 1, true, false, 22, true, 0 };
 
-// SSH task context — allocated as global to avoid heap fragmentation
 struct SSHTaskCtx {
     Profile      prof;
     ssh_session  sess;
@@ -189,12 +170,13 @@ struct SSHTaskCtx {
     volatile int state;   // 0=running, 1=ok, 2=failed
     char         errmsg[80];
 };
-static SSHTaskCtx  g_sshCtx;
-static volatile bool g_taskAbort = false;   // set true to signal task to abort
-static TaskHandle_t  g_sshTask   = nullptr; // so we can wait for it to finish
+static SSHTaskCtx    g_sshCtx;
+static volatile bool g_taskAbort = false;
+static TaskHandle_t  g_sshTask   = nullptr;
 
-unsigned long g_lastKey  = 0;
-unsigned long g_lastAct  = 0;   // last any-key activity, for screen timeout
+unsigned long g_lastKey       = 0;
+unsigned long g_lastAct       = 0;
+unsigned long g_lastWifiRetry = 0;
 bool     g_dimmed    = false;
 #define DEBOUNCE_MS 130
 
@@ -229,7 +211,6 @@ void touchActivity() {
     }
 }
 
-// Call this in any blocking wait loop (not SSH terminal — handled separately)
 void checkScreenTimeout() {
     if (g_cfg.screenTimeoutSec <= 0 || g_dimmed) return;
     if ((millis() - g_lastAct) > (unsigned long)g_cfg.screenTimeoutSec * 1000UL) {
@@ -238,39 +219,48 @@ void checkScreenTimeout() {
     }
 }
 
+void checkWifiRetry() {
+    // Detect silent WiFi drops
+    if (g_wifiOk && WiFi.status() != WL_CONNECTED) g_wifiOk = false;
+    if (g_cfg.wifiTimeoutMin <= 0) return;
+    if (g_wifiOk) return;
+    if (!g_ssid[0]) return;
+    unsigned long interval = (unsigned long)g_cfg.wifiTimeoutMin * 60000UL;
+    if ((millis() - g_lastWifiRetry) < interval) return;
+    g_lastWifiRetry = millis();
+    WiFi.begin(g_ssid, g_wpass);
+    for (int i = 0; i < 10 && WiFi.status() != WL_CONNECTED; i++)
+        vTaskDelay(300 / portTICK_PERIOD_MS);
+    g_wifiOk = (WiFi.status() == WL_CONNECTED);
+}
+
 
 // ═══════════════════════════════════════════════════════════════════════════════
 //  INPUT HELPERS
 // ═══════════════════════════════════════════════════════════════════════════════
 
-// Fn and Ctrl are regular keys on Cardputer, not modifier bits.
-// hid_keys contains raw HID scancodes: a=0x04..z=0x1D, ;=0x33, .=0x37, ,=0x36, /=0x38
 inline bool isFn()   { return M5Cardputer.Keyboard.isKeyPressed(KEY_FN); }
 inline bool isCtrl() { return M5Cardputer.Keyboard.isKeyPressed(KEY_LEFT_CTRL); }
 
-// Convert HID keycode to a-z (returns 0 if not a letter key)
 inline char hidToAlpha(uint8_t hid) {
     if (hid >= 0x04 && hid <= 0x1D) return 'a' + (hid - 0x04);
     return 0;
 }
 
-// Block until a key event; also handles screen timeout polling
 Keyboard_Class::KeysState waitKS() {
     while (true) {
         vTaskDelay(20 / portTICK_PERIOD_MS);
         checkScreenTimeout();
+        checkWifiRetry();
         M5Cardputer.update();
         if (M5Cardputer.Keyboard.isChange() && M5Cardputer.Keyboard.isPressed()) {
             touchActivity();
-            if (g_cfg.buzzer) {
-                M5Cardputer.Speaker.tone(4000, 20);  // short 20ms click at 4kHz
-            }
+            if (g_cfg.buzzer) M5Cardputer.Speaker.tone(4000, 20);
             return M5Cardputer.Keyboard.keysState();
         }
     }
 }
 
-// Returns single char: Enter→'\r', Backspace→'\b', Back/Cancel→KLEFT (',')
 char waitCh() {
     while (true) {
         auto st = waitKS();
@@ -309,7 +299,6 @@ void hintBar(const char* h) {
     M5Cardputer.Display.print(h);
 }
 
-
 void screenInit(const char* t, const char* h) {
     M5Cardputer.Display.fillScreen(C_BG);
     titleBar(t);
@@ -337,8 +326,7 @@ void bprintf(uint16_t col, const char* fmt, ...) {
     bprint(buf, col);
 }
 
-// Start a fresh WireGuard tunnel. Defined here (after bprint) so default-arg
-// calls like bprint("text") would work safely without relying on auto-prototypes.
+// Start a fresh WireGuard tunnel. Defined after bprint() for default-arg safety.
 bool wgStart(const Profile& p, const char* fp) {
     IPAddress tun;
     String a = p.wg_addr; int sl = a.indexOf('/'); if (sl >= 0) a = a.substring(0, sl);
@@ -365,12 +353,8 @@ bool wgStart(const Profile& p, const char* fp) {
 
 int visRows() { return BODYH / LH; }
 
-// How many chars fit in the label area at text size 2
-// Label starts at x=13; sub text (if present) reserves 50px on the right
-// Char width at size 2 = 12px
 static int labelCols(bool hasSub) { return hasSub ? 14 : 18; }
 
-// Draw a single list row. marqOff = char offset into label for selected row scroll.
 void drawRow(const LItem& it, int y, bool hi, int marqOff) {
     uint16_t bg = hi ? C_SELBG : C_BG;
     if (hi) M5Cardputer.Display.fillRect(0, y, DW, LH, C_SELBG);
@@ -382,12 +366,10 @@ void drawRow(const LItem& it, int y, bool hi, int marqOff) {
 
     char lbuf[20];
     if (!hi || lblLen <= maxCols) {
-        // Non-selected or short enough: just truncate
         strncpy(lbuf, it.label, maxCols);
         lbuf[maxCols] = '\0';
     } else {
-        // Selected and too long: show scrolling window
-        int off = marqOff % (lblLen + 3);  // +3 = gap before text loops
+        int off = marqOff % (lblLen + 3);
         for (int i = 0; i < maxCols; i++) {
             int ci = (off + i) % (lblLen + 3);
             lbuf[i] = (ci < lblLen) ? it.label[ci] : ' ';
@@ -428,7 +410,6 @@ void drawList(const LItem* it, int cnt, int sel, int sc,
     }
 }
 
-// Redraw only the selected row (for marquee updates — avoids full screen flicker)
 void redrawSelRow(const LItem* it, int cnt, int sel, int sc,
                   const char* title, const char* hint, int marqOff) {
     int rows = visRows();
@@ -436,7 +417,7 @@ void redrawSelRow(const LItem* it, int cnt, int sel, int sc,
     if (rowIdx < 0 || rowIdx >= rows) return;
     int lblLen = strlen(it[sel].label);
     int maxCols = labelCols(it[sel].sub[0] != '\0');
-    if (lblLen <= maxCols) return;  // short enough, no need to redraw
+    if (lblLen <= maxCols) return;
     drawRow(it[sel], BODYY + rowIdx * LH, true, marqOff);
 }
 
@@ -447,12 +428,11 @@ int runList(LItem* it, int cnt, const char* title, const char* hint,
     int sc     = (sel >= rows) ? sel - rows + 1 : 0;
     int marqOff = 0;
     unsigned long lastMarq = millis();
-    const unsigned long MARQ_MS = 220;  // scroll one char every 220ms
+    const unsigned long MARQ_MS = 220;
 
     drawList(it, cnt, sel, sc, title, hint, marqOff);
 
     while (true) {
-        // Non-blocking poll for keys
         vTaskDelay(20 / portTICK_PERIOD_MS);
         checkScreenTimeout();
         M5Cardputer.update();
@@ -490,7 +470,6 @@ int runList(LItem* it, int cnt, const char* title, const char* hint,
             }
         }
 
-        // Marquee tick — advance one char if selected label is long
         if (millis() - lastMarq >= MARQ_MS) {
             lastMarq = millis();
             int lblLen  = strlen(it[sel].label);
@@ -503,7 +482,6 @@ int runList(LItem* it, int cnt, const char* title, const char* hint,
     }
 }
 
-// String-array list — labels truncated to 28 chars to prevent overflow
 int pickStr(const char** opts, int n, const char* title, int startSel = 0) {
     LItem items[32];
     int lim = (n < 32) ? n : 32;
@@ -552,7 +530,6 @@ bool yesNo(const char* title, const char* q, bool defYes = false) {
 
 // ═══════════════════════════════════════════════════════════════════════════════
 //  TEXT INPUT
-//  Nav keys (;  .  ,  /) are suppressed — they won't type or navigate here
 // ═══════════════════════════════════════════════════════════════════════════════
 
 String typeText(const char* title, const char* prompt,
@@ -574,16 +551,13 @@ String typeText(const char* title, const char* prompt,
         if (hidden) {
             int len = val.length();
             if (g_cfg.passDisplay == 2) {
-                // show full password
                 M5Cardputer.Display.print(val);
             } else if (g_cfg.passDisplay == 1) {
-                // show last 3 chars
                 int show = (len >= 3) ? 3 : len;
                 int hide = len - show;
                 for (int i = 0; i < hide; i++) M5Cardputer.Display.print('*');
                 for (int i = hide; i < len; i++) M5Cardputer.Display.print(val[i]);
             } else {
-                // all hidden
                 for (int i = 0; i < len; i++) M5Cardputer.Display.print('*');
             }
         } else {
@@ -603,14 +577,10 @@ String typeText(const char* title, const char* prompt,
 
         if (st.enter) return val;
         if (st.del && val.length()) { val.remove(val.length()-1); redraw(); continue; }
-
-        // In text input: Fn key combos are ignored entirely (no ctrl chars)
         if (M5Cardputer.Keyboard.isKeyPressed(KEY_FN)) continue;
 
         for (auto ch : st.word) {
-            // , = cancel/back = return empty or current value
             if ((uint8_t)ch == 0x1b || ch == KLEFT) return val;
-            // All other chars including . , ; / are valid in text fields (IP addresses etc.)
             val += ch;
         }
         redraw();
@@ -773,7 +743,6 @@ bool parseWGFile(const char* path, Profile& p) {
     return p.wg_privkey[0] && p.wg_endpoint[0];
 }
 
-// Pure file browser — only shows .conf files. Returns true if one was loaded.
 bool pickWGConf(Profile& p) {
     static char names[MAX_WGF][40];
     static const char* ptrs[MAX_WGF];
@@ -810,7 +779,7 @@ bool pickWGConf(Profile& p) {
     }
 
     int ch = pickStr(ptrs, n, "WG Config Files");
-    if (ch < 0) return false;  // , = back, no change
+    if (ch < 0) return false;
 
     screenInit("Loading WG", "");
     bprintf(C_DIM, "Loading: %s", names[ch]);
@@ -845,7 +814,7 @@ void profileCard(const Profile& p) {
     row("Host:  ", p.host, C_TITFG);
     row("Port:  ", portBuf);
     row("User:  ", p.user);
-    // Build password display string based on setting
+
     char passBuf[68];
     if (!p.pass[0]) {
         strcpy(passBuf, "(none)");
@@ -860,7 +829,6 @@ void profileCard(const Profile& p) {
         strncpy(passBuf+hide, p.pass+(len-show), show);
         passBuf[hide+show] = '\0';
     } else {
-        // All hidden
         int len = strlen(p.pass); if (len>12) len=12;
         for (int i=0;i<len;i++) passBuf[i]='*';
         passBuf[len]='\0';
@@ -885,16 +853,13 @@ void editProfile(int idx) {
     if (isNew) { memset(&p,0,sizeof(p)); p.port=g_cfg.defaultPort; }
     else        p = g_prof[idx];
 
-    // Name
     { String v = typeText(isNew?"New Profile":"Edit Profile","Profile name:",p.name);
       if (v.isEmpty() && isNew) return;
       strncpy(p.name, v.c_str(), sizeof(p.name)-1); }
 
-    // Host
     { String v = typeText(p.name,"Host / IP:",p.host);
       strncpy(p.host, v.c_str(), sizeof(p.host)-1); }
 
-    // Port
     { const char* po[] = { "22   (SSH default)", "2222", "Custom..." };
       int cur = (p.port==22)?0:(p.port==2222)?1:2;
       int ch = pickStr(po, 3, "SSH Port", cur);
@@ -907,7 +872,6 @@ void editProfile(int idx) {
       }
     }
 
-    // User
     { static const char* uo[MAX_USR+2];
       int n=0;
       if (p.user[0]) uo[n++]=p.user;
@@ -924,9 +888,7 @@ void editProfile(int idx) {
       }
     }
 
-    // Password
     if (isNew) {
-        // New profile — no existing password, just prompt directly
         String v = typeText(p.name, "Password:", "", true);
         strncpy(p.pass, v.c_str(), sizeof(p.pass)-1);
     } else {
@@ -939,21 +901,17 @@ void editProfile(int idx) {
         }
     }
 
-    // WireGuard on/off
     { const char* wo[]={ "No WireGuard","Use WireGuard" };
       int ch=pickStr(wo,2,"WireGuard",p.useWG?1:0);
       if (ch>=0) p.useWG=(ch==1);
     }
 
-    // WireGuard config — explicit two-option menu, always both visible
     if (p.useWG) {
         const char* wgOpts[] = { "Pick config file", "Enter keys manually" };
         int wgChoice = pickStr(wgOpts, 2, "WG config source");
         if (wgChoice == 0) {
-            // File picker — show .conf files from SD
             pickWGConf(p);
         } else if (wgChoice == 1) {
-            // Manual entry
             bool reenter = true;
             if (p.wg_privkey[0])
                 reenter = yesNo("WireGuard Keys","Replace existing keys?",false);
@@ -969,10 +927,8 @@ void editProfile(int idx) {
                   strncpy(p.wg_endpoint,v.c_str(),sizeof(p.wg_endpoint)-1); }
             }
         }
-        // wgChoice == -1 (Esc) = keep whatever is already set
     }
 
-    // Save?
     if (yesNo(p.name,"Save profile?",true)) {
         if (!isNew && strcmp(g_prof[idx].name,p.name)!=0)
             SD.remove(profPath(g_prof[idx].name).c_str());
@@ -1074,7 +1030,6 @@ void runProfileList() {
             } else if (c==KLEFT) { return; }
         }
 
-        // Marquee tick for profile names
         if (millis()-lastMarq >= MARQ_MS) {
             lastMarq=millis();
             if (g_profCnt > 0) {
@@ -1096,7 +1051,6 @@ void runProfileList() {
 
 void doConnect(const String& ssid, const String& pw) {
     screenInit("WiFi","");
-    // Truncate SSID display to avoid overflow
     char ssbuf[20]; strncpy(ssbuf, ssid.c_str(), 19); ssbuf[19]='\0';
     bprintf(C_DIM,"Connecting: %s", ssbuf);
     WiFi.begin(ssid.c_str(), pw.c_str());
@@ -1120,11 +1074,10 @@ void runWifiScan() {
     bprint("Scanning...", C_DIM);
 
     WiFi.mode(WIFI_STA);
-    WiFi.disconnect(true);   // true = erase AP to fully reset radio state
+    WiFi.disconnect(true);
     vTaskDelay(500 / portTICK_PERIOD_MS);
 
-    // Synchronous scan — simpler and more reliable on ESP32
-    int found = WiFi.scanNetworks(false, true);  // false=sync, true=show hidden
+    int found = WiFi.scanNetworks(false, true);
 
     if (found <= 0) {
         bprint("", C_DIM);
@@ -1136,7 +1089,6 @@ void runWifiScan() {
     }
     if (found > MAX_NET) found = MAX_NET;
 
-    // Save what we need BEFORE scanDelete wipes the scan results
     static LItem items[MAX_NET];
     static char ssids[MAX_NET][44];
     static wifi_auth_mode_t encs[MAX_NET];
@@ -1162,7 +1114,6 @@ void runWifiScan() {
 
 void runWifiMenu() {
     while (true) {
-        // Keep "Scan" label short — only show first 10 chars of SSID
         static char item0[32];
         if (g_wifiOk) {
             char ssbuf[11]; strncpy(ssbuf,g_ssid,10); ssbuf[10]='\0';
@@ -1177,7 +1128,7 @@ void runWifiMenu() {
         opts[n++]="Back";
 
         int ch=pickStr(opts,n,"WiFi");
-        if (ch<0||strcmp(opts[ch],"Back")==0) return;   // Esc or Back = return
+        if (ch<0||strcmp(opts[ch],"Back")==0) return;
         if      (strncmp(opts[ch],"Scan",4)==0)            runWifiScan();
         else if (strcmp(opts[ch],"Enter SSID manually")==0) {
             String ssid=typeText("WiFi Manual","SSID:");
@@ -1192,18 +1143,16 @@ void runWifiMenu() {
 
 
 // ═══════════════════════════════════════════════════════════════════════════════
-//  SETTINGS SCREEN  –  grouped categories
+//  SETTINGS
 // ═══════════════════════════════════════════════════════════════════════════════
 
 void runSettings() {
-    // Top-level categories
     const char* cats[] = { "Display", "Terminal", "Connection", "Security", "< Back" };
     while (true) {
         int cat = pickStr(cats, 5, "Settings");
         if (cat < 0 || cat == 4) return;
 
         if (cat == 0) {
-            // ── Display ──────────────────────────────────────────────────────
             while (true) {
                 char scrBuf[32], brtBuf[32];
                 if (g_cfg.screenTimeoutSec <= 0) snprintf(scrBuf, sizeof(scrBuf), "Screen dim  Never");
@@ -1228,7 +1177,6 @@ void runSettings() {
             }
 
         } else if (cat == 1) {
-            // ── Terminal ─────────────────────────────────────────────────────
             while (true) {
                 char fntBuf[32], buzBuf[32];
                 snprintf(fntBuf, sizeof(fntBuf), "Font size   %d", g_cfg.termFontSize);
@@ -1248,7 +1196,6 @@ void runSettings() {
             }
 
         } else if (cat == 2) {
-            // ── Connection ───────────────────────────────────────────────────
             while (true) {
                 char sshBuf[32], wfiBuf[32], kaBuf[32], portBuf[32], acBuf[32];
                 if (g_cfg.sshTimeoutMin <= 0) snprintf(sshBuf, sizeof(sshBuf), "SSH idle    Never");
@@ -1295,7 +1242,6 @@ void runSettings() {
             }
 
         } else if (cat == 3) {
-            // ── Security ─────────────────────────────────────────────────────
             while (true) {
                 const char* pdNames[] = { "Hidden (****)", "Last 3 chars", "Visible" };
                 char pdBuf[32];
@@ -1314,10 +1260,9 @@ void runSettings() {
 
 
 // ═══════════════════════════════════════════════════════════════════════════════
-//  HOME SCREEN  –  Bruce-style: full screen, one tile at a time, ; / to navigate
+//  HOME SCREEN
 // ═══════════════════════════════════════════════════════════════════════════════
 
-// Draw a proper WiFi fan icon centred at cx,cy — same visual size as gear (r~16)
 void drawWifiIcon(int cx, int cy, uint16_t col) {
     M5Cardputer.Display.fillCircle(cx, cy, 3, col);
     M5Cardputer.Display.drawArc(cx, cy,  8,  6, 225, 315, col);
@@ -1335,7 +1280,6 @@ void drawSshIcon(int cx, int cy, uint16_t col, uint16_t bg) {
 void drawGearIcon(int cx, int cy, uint16_t col) {
     M5Cardputer.Display.drawCircle(cx, cy, 12, col);
     M5Cardputer.Display.drawCircle(cx, cy, 5,  col);
-    // teeth at 0,60,120,180,240,300 degrees
     for (int a = 0; a < 360; a += 60) {
         float r = a * 3.14159f / 180.0f;
         int x1 = cx + (int)(12 * cosf(r));
@@ -1349,57 +1293,40 @@ void drawGearIcon(int cx, int cy, uint16_t col) {
 void drawHome(int sel) {
     M5Cardputer.Display.fillScreen(C_BG);
 
-    // Full-screen tile for current selection
     uint16_t tileColors[3] = {C_WIFI, C_PROF, C_SETT};
     const char* labels[] = {"WiFi", "Profiles", "Settings"};
     uint16_t col = tileColors[sel];
 
-    // Layout constants (all pixel-precise):
-    // Content area: y=0..116 (status bar at 117)
-    // Up-triangle tip y=6, base y=12
-    // Down-triangle tip y=110, base y=104
-    // Usable band: y=14..102 = 88px, centre=58
-    // Block: icon 40px + 6px gap + label 16px = 62px, half=31
-    // Icon cy = 58-31+20 = 47, label top = 69
-
-    // Up triangle ▲ — tip at top (y=6, 1px), base at bottom (y=12, wide)
     if (sel > 0) {
         int ax = DW/2;
         for (int i = 0; i < 7; i++)
             M5Cardputer.Display.drawLine(ax-i, 6+i, ax+i, 6+i, C_DIM);
     }
-    // Down triangle ▼ — wide at top (y=104), tip at bottom (y=110, 1px)
     if (sel < 2) {
         int ax = DW/2;
         for (int i = 0; i < 7; i++)
             M5Cardputer.Display.drawLine(ax-(6-i), 104+i, ax+(6-i), 104+i, C_DIM);
     }
 
-    // Vertical position dots on right edge (centred in content area)
     for (int i = 0; i < 3; i++) {
         int dx = DW - 8;
         int dy = 58 - 16 + i*16;
-        if (i == sel)
-            M5Cardputer.Display.fillCircle(dx, dy, 4, col);
-        else
-            M5Cardputer.Display.drawCircle(dx, dy, 3, C_DIM);
+        if (i == sel) M5Cardputer.Display.fillCircle(dx, dy, 4, col);
+        else          M5Cardputer.Display.drawCircle(dx, dy, 3, C_DIM);
     }
 
-    // Icon centred in band
     int cx = DW / 2;
     int cy = 47;
     if (sel == 0)      drawWifiIcon(cx, cy, col);
     else if (sel == 1) drawSshIcon(cx, cy, col, C_BG);
     else               drawGearIcon(cx, cy, col);
 
-    // Label below icon
     M5Cardputer.Display.setTextSize(2);
     M5Cardputer.Display.setTextColor(col, C_BG);
     int lw = strlen(labels[sel]) * 12;
     M5Cardputer.Display.setCursor(cx - lw/2, cy + 22);
     M5Cardputer.Display.print(labels[sel]);
 
-    // Status bar at bottom
     const int SHBAR = 18;
     int y = DH - SHBAR;
     M5Cardputer.Display.fillRect(0, y, DW, SHBAR, C_HNTBG);
@@ -1436,7 +1363,6 @@ void runHome() {
 //  CONNECT  (WireGuard + SSH)
 // ═══════════════════════════════════════════════════════════════════════════════
 
-// Task that runs ssh_connect / auth / channel open — needs big stack
 static void sshConnectTask(void* arg) {
     SSHTaskCtx* ctx = (SSHTaskCtx*)arg;
     const Profile& p = ctx->prof;
@@ -1447,14 +1373,12 @@ static void sshConnectTask(void* arg) {
         ctx->state = 2; vTaskDelete(NULL); return;
     }
 
-    int verb = SSH_LOG_NOLOG, port = p.port;
+    int verb = SSH_LOG_NOLOG, port = p.port, timeout = 30;
     ssh_options_set(ctx->sess, SSH_OPTIONS_HOST, p.host);
     ssh_options_set(ctx->sess, SSH_OPTIONS_USER, p.user);
     ssh_options_set(ctx->sess, SSH_OPTIONS_PORT, &port);
     ssh_options_set(ctx->sess, SSH_OPTIONS_LOG_VERBOSITY, &verb);
-    if (g_cfg.keepAlive) {
-        int ka = 60; ssh_options_set(ctx->sess, SSH_OPTIONS_TIMEOUT, &ka);
-    }
+    ssh_options_set(ctx->sess, SSH_OPTIONS_TIMEOUT, &timeout);
 
     if (g_taskAbort || ssh_connect(ctx->sess) != SSH_OK) {
         if (g_taskAbort) strlcpy(ctx->errmsg, "Aborted", sizeof(ctx->errmsg));
@@ -1462,6 +1386,22 @@ static void sshConnectTask(void* arg) {
         ssh_free(ctx->sess); ctx->sess = nullptr;
         ctx->state = 2; vTaskDelete(NULL); return;
     }
+
+    // Enable TCP keepalive on the socket to prevent NAT/firewall timeouts
+    if (g_cfg.keepAlive) {
+        socket_t fd = ssh_get_fd(ctx->sess);
+        if (fd >= 0) {
+            int yes = 1;
+            int idle = 60;    // first keepalive after 60s idle
+            int intvl = 15;   // retry every 15s
+            int cnt = 4;      // drop after 4 missed replies
+            setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &yes, sizeof(yes));
+            setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &idle, sizeof(idle));
+            setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &intvl, sizeof(intvl));
+            setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &cnt, sizeof(cnt));
+        }
+    }
+
     if (ssh_userauth_password(ctx->sess, nullptr, p.pass) != SSH_AUTH_SUCCESS) {
         strlcpy(ctx->errmsg, "Auth failed", sizeof(ctx->errmsg));
         ssh_disconnect(ctx->sess); ssh_free(ctx->sess); ctx->sess = nullptr;
@@ -1469,9 +1409,6 @@ static void sshConnectTask(void* arg) {
     }
 
     ctx->ch = ssh_channel_new(ctx->sess);
-
-    // Calculate terminal dimensions based on font size
-    // Display is 240x123px usable. Font1 = 6px wide, 8px tall. Font2 = 12x16.
     int termCols = (g_cfg.termFontSize == 2) ? 20 : 40;
     int termRows = (g_cfg.termFontSize == 2) ?  7 : 14;
 
@@ -1485,12 +1422,11 @@ static void sshConnectTask(void* arg) {
         ctx->state = 2; vTaskDelete(NULL); return;
     }
 
-    ctx->state = 1;   // connected — main task takes over
+    ctx->state = 1;
     vTaskDelete(NULL);
 }
 
 void runConnect(int idx) {
-    // copy profile so task has its own copy
     g_sshCtx.prof  = g_prof[idx];
     g_sshCtx.sess  = nullptr;
     g_sshCtx.ch    = nullptr;
@@ -1506,16 +1442,14 @@ void runConnect(int idx) {
         wgFingerprint(p, newFp, sizeof(newFp));
         bool same = (g_wg != nullptr && strcmp(newFp, g_wgFingerprint) == 0);
         if (same) {
-            // Same config — just resume routing through the existing tunnel (safe always)
             bprint("WG resuming...", C_DIM);
             wgResume();
             bprint("WG up.", C_OK);
         } else if (g_wg == nullptr) {
-            // First time — start fresh
             bprint("WireGuard...", C_DIM);
             if (!wgStart(p, newFp)) return;
         } else {
-            // Different WG config — clean teardown if TCP hasn't touched the tunnel yet
+            // Different WG config — clean teardown only if TCP hasn't used the tunnel
             if (!g_wgTcpUsed) {
                 bprint("Switching WG...", C_DIM);
                 g_wg->end(); delete g_wg;
@@ -1523,7 +1457,7 @@ void runConnect(int idx) {
                 vTaskDelay(400 / portTICK_PERIOD_MS);
                 if (!wgStart(p, newFp)) return;
             } else {
-                // TCP has used the tunnel — end() would crash. Restart into new profile.
+                // TCP touched the netif — end() would crash lwIP. Restart instead.
                 bprint("Switching WG...", C_DIM);
                 delay(600);
                 g_bootProfileIdx = idx;
@@ -1531,11 +1465,9 @@ void runConnect(int idx) {
             }
         }
     } else {
-        // Profile doesn't use WG — suspend tunnel if one is running (restore WiFi routing)
         if (g_wg) wgSuspend();
     }
 
-    // Spawn SSH connect task with 32 KB stack on core 0
     bprint("SSH connecting...", C_DIM);
     g_taskAbort = false;
     g_sshTask   = nullptr;
@@ -1545,21 +1477,18 @@ void runConnect(int idx) {
         bprint("Task create failed!", C_ERR); delay(2000); return;
     }
 
-    // Wait for task to finish — show dots, allow back key to abort
     unsigned long t0 = millis();
     while (g_sshCtx.state == 0) {
         if ((millis() - t0) > 30000UL) {
             bprint("Timeout!", C_ERR);
             g_taskAbort = true;
-            // Wait for task to actually exit before touching g_sshCtx
             while (g_sshTask != nullptr && eTaskGetState(g_sshTask) != eDeleted)
                 vTaskDelay(50 / portTICK_PERIOD_MS);
             g_sshTask = nullptr;
             delay(500);
-            wgSuspend(); // safe — just restores WiFi routing, no netif_remove
+            wgSuspend();
             return;
         }
-        // Allow back key to cancel connecting
         M5Cardputer.update();
         if (M5Cardputer.Keyboard.isChange() && M5Cardputer.Keyboard.isPressed()) {
             auto st = M5Cardputer.Keyboard.keysState();
@@ -1571,7 +1500,7 @@ void runConnect(int idx) {
                         vTaskDelay(50 / portTICK_PERIOD_MS);
                     g_sshTask = nullptr;
                     delay(300);
-                    wgSuspend(); // safe — just restores WiFi routing, no netif_remove
+                    wgSuspend();
                     return;
                 }
             }
@@ -1584,32 +1513,26 @@ void runConnect(int idx) {
     if (g_sshCtx.state == 2) {
         bprintf(C_ERR, "%s", g_sshCtx.errmsg);
         delay(2500);
-        wgSuspend(); // safe — just restores WiFi routing, no netif_remove
+        wgSuspend();
         return;
     }
 
-    // state == 1: connected — run terminal on main task
-    if (p.useWG) g_wgTcpUsed = true; // TCP now active through WG netif — end() unsafe from here
+    if (p.useWG) g_wgTcpUsed = true;
     ssh_session sess = g_sshCtx.sess;
     ssh_channel ch   = g_sshCtx.ch;
 
     M5Cardputer.Display.fillScreen(C_BG);
     titleBar(p.name);
-    // runSSHTerm draws the hint bar and sets cursor on entry
 
     runSSHTerm(sess, ch);
 
-    // Clean up SSH — explicit sequence matters when using WireGuard:
-    // ssh_disconnect() closes the TCP connection that runs through the WG netif.
-    // We must wait for lwIP to finish processing the TCP FIN *before* calling
-    // Never call end() after TCP touched the netif — use wgSuspend() to restore routing.
     if (ch) {
         ssh_channel_send_eof(ch);
         ssh_channel_close(ch);
         ssh_channel_free(ch);
     }
     if (sess) {
-        ssh_disconnect(sess);  // closes TCP synchronously
+        ssh_disconnect(sess);
         ssh_free(sess);
     }
     g_sshCtx.sess = nullptr;
@@ -1617,10 +1540,7 @@ void runConnect(int idx) {
     g_sshCtx.state = 0;
 
     vTaskDelay(500 / portTICK_PERIOD_MS);
-
-    // WG tunnel stays up — wgSuspend() restores WiFi routing if next profile needs it.
-    // Never call end() after TCP has used the netif; wgResume/Suspend are always safe.
-    wgSuspend(); // restore WiFi as default route now that SSH is done
+    wgSuspend();
     screenInit(p.name, "Any key to return");
     bprint("Session ended.", C_DIM);
     waitCh();
@@ -1631,11 +1551,10 @@ void runConnect(int idx) {
 //  SSH TERMINAL
 // ═══════════════════════════════════════════════════════════════════════════════
 
-// ── Terminal cell ─────────────────────────────────────────────────────────────
 struct TCell {
-    char     ch;   // 0 = empty
-    uint16_t fg;   // foreground colour (RGB565)
-    uint16_t bg;   // background colour (RGB565)
+    char     ch;
+    uint16_t fg;
+    uint16_t bg;
     bool     bold;
 };
 
@@ -1643,17 +1562,15 @@ void runSSHTerm(ssh_session sess, ssh_channel ch) {
     const int TOP  = TITLEH + 2;
     const int BOT  = DH - HINTH;
 
-    // ── Buffer constants ──────────────────────────────────────────────────────
     const int MAXCOLS = 40;
     const int MAXROWS = 14;
 
-    // Two screen buffers: normal [0] and alternate [1] (for nano/mc/vim)
     static TCell tbuf[2][MAXROWS][MAXCOLS];
-    static int   tcx, tcy;           // cursor position in active buffer
-    static int   savedCx, savedCy;   // ESC[s / ESC[u
+    static int   tcx, tcy;
+    static int   savedCx, savedCy;
     static int   tCols, tRows;
-    static int   scrollTop, scrollBot; // scroll region (0-based rows, inclusive)
-    static bool  altScreen;           // true = alternate buffer active
+    static int   scrollTop, scrollBot;
+    static bool  altScreen;
 
     auto lh       = [&]() { return g_cfg.termFontSize * 8; };
     auto termCols = [&]() { return (g_cfg.termFontSize == 2) ? 20 : 40; };
@@ -1662,18 +1579,14 @@ void runSSHTerm(ssh_session sess, ssh_channel ch) {
     auto rowY     = [&](int r) { return TOP + r * lh(); };
     auto activeBuf= [&]() -> TCell(*)[MAXCOLS] { return tbuf[altScreen ? 1 : 0]; };
 
-    // ── SGR colour table (standard 8 ANSI colours) ────────────────────────────
-    // Index 0-7 normal, 8-15 bright
     static const uint16_t ansiCol[16] = {
-        0x0000, 0x8000, 0x0400, 0x8400, 0x0010, 0x8010, 0x0410, 0xC618, // 0-7
-        0x4208, 0xF800, 0x07E0, 0xFFE0, 0x001F, 0xF81F, 0x07FF, 0xFFFF  // 8-15 bright
+        0x0000, 0x8000, 0x0400, 0x8400, 0x0010, 0x8010, 0x0410, 0xC618,
+        0x4208, 0xF800, 0x07E0, 0xFFE0, 0x001F, 0xF81F, 0x07FF, 0xFFFF
     };
 
-    // Current SGR state
     static uint16_t curFg, curBg;
     static bool     curBold;
 
-    // ── Draw helpers ──────────────────────────────────────────────────────────
     auto drawCell = [&](int col, int row) {
         auto& cell = activeBuf()[row][col];
         int px = col * cw(), py = rowY(row);
@@ -1703,9 +1616,6 @@ void runSSHTerm(ssh_session sess, ssh_channel ch) {
         M5Cardputer.Display.setTextColor(C_FG, C_BG);
     };
 
-    // Scroll the scroll region up by n lines
-    // Scroll region up by n lines from 'fromRow' (default scrollTop).
-    // ESC[T uses scrollTop; ESC[M (delete lines) uses tcy.
     auto scrollRegionUp = [&](int n2, int fromRow = -1) {
         if (fromRow < 0) fromRow = scrollTop;
         for (int rep = 0; rep < n2; rep++) {
@@ -1718,8 +1628,6 @@ void runSSHTerm(ssh_session sess, ssh_channel ch) {
         redrawAll();
     };
 
-    // Scroll region down by n lines from 'fromRow' (default scrollTop).
-    // ESC[S uses scrollTop; ESC[L (insert lines) uses tcy.
     auto scrollRegionDown = [&](int n2, int fromRow = -1) {
         if (fromRow < 0) fromRow = scrollTop;
         for (int rep = 0; rep < n2; rep++) {
@@ -1732,14 +1640,12 @@ void runSSHTerm(ssh_session sess, ssh_channel ch) {
         redrawAll();
     };
 
-    // Clear entire buffer
     auto clearBuf = [&](int bufIdx) {
         for (int r = 0; r < MAXROWS; r++)
             for (int c2 = 0; c2 < MAXCOLS; c2++)
                 tbuf[bufIdx][r][c2] = {0, C_FG, C_BG, false};
     };
 
-    // Write char into buffer at cursor, advance cursor
     auto putChar = [&](char c2) {
         if (tcx >= tCols) {
             tcx = 0; tcy++;
@@ -1751,7 +1657,7 @@ void runSSHTerm(ssh_session sess, ssh_channel ch) {
         tcx++;
     };
 
-    // ── Init ─────────────────────────────────────────────────────────────────
+    // Init
     tCols = termCols(); tRows = termRows();
     scrollTop = 0; scrollBot = tRows - 1;
     altScreen = false;
@@ -1761,20 +1667,20 @@ void runSSHTerm(ssh_session sess, ssh_channel ch) {
     M5Cardputer.Display.fillRect(0, TOP, DW, BOT - TOP, C_BG);
 
     auto showHint = [&]() {
-        hintBar("G0/Fn+Q=quit  Fn+;.,/=arrows  Ctrl=^key  Tab=tab");
+        hintBar("G0/Fn+Q=quit  Fn+;.,/=arrows  Fn+F=font");
         M5Cardputer.Display.setTextSize(g_cfg.termFontSize);
         M5Cardputer.Display.setTextColor(C_FG, C_BG);
     };
     showHint();
 
-    // ── ANSI parser state ─────────────────────────────────────────────────────
+    // ANSI parser state
     static bool  inEsc = false, inCSI = false, inOSC = false;
     static char  csiBuf[64];
     static int   csiLen = 0;
-    static bool  csiPriv = false;   // true if ESC[? prefix
+    static bool  csiPriv = false;
     inEsc = false; inCSI = false; inOSC = false; csiLen = 0; csiPriv = false;
 
-    unsigned long sshLastActivity = millis();
+    unsigned long sshLastActivity  = millis();
 
     while (true) {
         vTaskDelay(8 / portTICK_PERIOD_MS);
@@ -1792,7 +1698,7 @@ void runSSHTerm(ssh_session sess, ssh_channel ch) {
             g_dimmed = true;
         }
 
-        // ── Keyboard ─────────────────────────────────────────────────────────
+        // Keyboard
         if (M5Cardputer.Keyboard.isChange() && M5Cardputer.Keyboard.isPressed()) {
             unsigned long now = millis();
             if (now - g_lastKey >= DEBOUNCE_MS) {
@@ -1815,16 +1721,15 @@ void runSSHTerm(ssh_session sess, ssh_channel ch) {
                             showHint();
                             ssh_channel_change_pty_size(ch, tCols, tRows);
                         }
-                        if (hid == 0x33) ssh_channel_write(ch, "\x1b[A", 3); // up
-                        if (hid == 0x37) ssh_channel_write(ch, "\x1b[B", 3); // down
-                        if (hid == 0x36) ssh_channel_write(ch, "\x1b[D", 3); // left
-                        if (hid == 0x38) ssh_channel_write(ch, "\x1b[C", 3); // right
+                        if (hid == 0x33) ssh_channel_write(ch, "\x1b[A", 3);
+                        if (hid == 0x37) ssh_channel_write(ch, "\x1b[B", 3);
+                        if (hid == 0x36) ssh_channel_write(ch, "\x1b[D", 3);
+                        if (hid == 0x38) ssh_channel_write(ch, "\x1b[C", 3);
                     }
                 } else if (isCtrl()) {
                     for (auto hid : st.hid_keys) {
                         char a = hidToAlpha(hid);
                         if (a) { char cc = a - 'a' + 1; ssh_channel_write(ch, &cc, 1); }
-                        // Ctrl+[ = ESC (useful in vim)
                         if (hid == 0x2F) { const char e = 0x1B; ssh_channel_write(ch, &e, 1); }
                     }
                 } else {
@@ -1834,7 +1739,6 @@ void runSSHTerm(ssh_session sess, ssh_channel ch) {
                     }
                     if (st.del)   { char bs = 0x7F; ssh_channel_write(ch, &bs, 1); }
                     if (st.enter) { const char cr = '\r'; ssh_channel_write(ch, &cr, 1); }
-                    // Tab key (HID 0x2B)
                     for (auto hid : st.hid_keys) {
                         if (hid == 0x2B) { const char tab = '\t'; ssh_channel_write(ch, &tab, 1); }
                     }
@@ -1842,7 +1746,7 @@ void runSSHTerm(ssh_session sess, ssh_channel ch) {
             }
         }
 
-        // ── Receive & render ─────────────────────────────────────────────────
+        // Receive & render
         char rbuf[256];
         int n = ssh_channel_read_nonblocking(ch, rbuf, sizeof(rbuf), 0);
         if (n > 0) {
@@ -1850,20 +1754,17 @@ void runSSHTerm(ssh_session sess, ssh_channel ch) {
             for (int i = 0; i < n; i++) {
                 uint8_t c2 = rbuf[i];
 
-                // OSC: swallow until BEL or ST
                 if (inOSC) {
                     if (c2 == 0x07 || c2 == 0x9C) inOSC = false;
                     else if (c2 == 0x1B) { inOSC = false; inEsc = true; }
                     continue;
                 }
 
-                // CSI accumulator
                 if (inCSI) {
                     if (c2 >= 0x40 && c2 <= 0x7E) {
                         csiBuf[csiLen] = '\0';
                         inCSI = false;
 
-                        // Parse params: p[] array, up to 8 params
                         int p[8]; int pc = 0;
                         memset(p, -1, sizeof(p));
                         char* s = csiBuf;
@@ -1878,18 +1779,15 @@ void runSSHTerm(ssh_session sess, ssh_channel ch) {
                                 s++;
                             } else s++;
                         }
-                        // Helpers
                         auto P1 = [&](int def) { return (p[0] < 0) ? def : p[0]; };
                         auto P2 = [&](int def) { return (p[1] < 0) ? def : p[1]; };
 
                         if (csiPriv) {
-                            // ESC[? sequences — mode set/reset
                             if (c2 == 'h' || c2 == 'l') {
                                 bool set = (c2 == 'h');
                                 int mode = P1(0);
                                 if (mode == 25) {
                                 } else if (mode == 1049 || mode == 47 || mode == 1047) {
-                                    // Alternate screen buffer
                                     if (set && !altScreen) {
                                         altScreen = true;
                                         savedCx = tcx; savedCy = tcy;
@@ -1924,7 +1822,7 @@ void runSSHTerm(ssh_session sess, ssh_channel ch) {
                             case 'd': { tcy = P1(1)-1; if(tcy<0)tcy=0; if(tcy>=tRows)tcy=tRows-1; break; }
                             case 'J': {
                                 int arg=P1(0);
-                                if (arg==0) { // erase below
+                                if (arg==0) {
                                     for(int x=tcx;x<tCols;x++) activeBuf()[tcy][x]={0,curFg,curBg,false};
                                     M5Cardputer.Display.fillRect(tcx*cw(), rowY(tcy), DW-tcx*cw(), lh(), curBg);
                                     for(int r=tcy+1;r<tRows;r++){
@@ -1932,7 +1830,7 @@ void runSSHTerm(ssh_session sess, ssh_channel ch) {
                                         for(int x=0;x<tCols;x++) activeBuf()[r][x]={0,curFg,curBg,false};
                                         M5Cardputer.Display.fillRect(0,rowY(r),DW,lh(),curBg);
                                     }
-                                } else if (arg==1) { // erase above
+                                } else if (arg==1) {
                                     for(int r=0;r<tcy;r++){
                                         memset(activeBuf()[r],0,sizeof(TCell)*MAXCOLS);
                                         for(int x=0;x<tCols;x++) activeBuf()[r][x]={0,curFg,curBg,false};
@@ -1940,7 +1838,7 @@ void runSSHTerm(ssh_session sess, ssh_channel ch) {
                                     }
                                     for(int x=0;x<=tcx;x++) activeBuf()[tcy][x]={0,curFg,curBg,false};
                                     M5Cardputer.Display.fillRect(0,rowY(tcy),(tcx+1)*cw(),lh(),curBg);
-                                } else { // erase all
+                                } else {
                                     clearBuf(altScreen?1:0);
                                     M5Cardputer.Display.fillRect(0,TOP,DW,BOT-TOP,curBg);
                                     tcx=tcy=0;
@@ -1961,22 +1859,16 @@ void runSSHTerm(ssh_session sess, ssh_channel ch) {
                                 }
                                 break;
                             }
-                            case 'L': { // insert n lines at cursor row
-                                scrollRegionDown(P1(1), tcy);
-                                break;
-                            }
-                            case 'M': { // delete n lines at cursor row
-                                scrollRegionUp(P1(1), tcy);
-                                break;
-                            }
-                            case 'P': { // delete n chars
+                            case 'L': { scrollRegionDown(P1(1), tcy); break; }
+                            case 'M': { scrollRegionUp(P1(1), tcy);  break; }
+                            case 'P': {
                                 int del=P1(1);
                                 for(int x=tcx;x<tCols;x++)
                                     activeBuf()[tcy][x]=(x+del<tCols)?activeBuf()[tcy][x+del]:TCell{0,curFg,curBg,false};
                                 drawRow(tcy);
                                 break;
                             }
-                            case '@': { // insert n blank chars
+                            case '@': {
                                 int ins=P1(1);
                                 for(int x=tCols-1;x>=tcx;x--)
                                     activeBuf()[tcy][x]=(x-ins>=tcx)?activeBuf()[tcy][x-ins]:TCell{0,curFg,curBg,false};
@@ -1985,7 +1877,7 @@ void runSSHTerm(ssh_session sess, ssh_channel ch) {
                             }
                             case 'S': { scrollRegionUp(P1(1));   break; }
                             case 'T': { scrollRegionDown(P1(1)); break; }
-                            case 'r': { // set scroll region
+                            case 'r': {
                                 scrollTop = P1(1)-1; scrollBot = P2(tRows)-1;
                                 if(scrollTop<0) scrollTop=0;
                                 if(scrollBot>=tRows) scrollBot=tRows-1;
@@ -2000,17 +1892,15 @@ void runSSHTerm(ssh_session sess, ssh_channel ch) {
                                 if(tcy>=tRows)tcy=tRows-1;
                                 break;
                             }
-                            case 'm': { // SGR — colours and attributes
-                                if (pc == 0) { // ESC[m = reset
-                                    curFg=C_FG; curBg=C_BG; curBold=false; break;
-                                }
+                            case 'm': {
+                                if (pc == 0) { curFg=C_FG; curBg=C_BG; curBold=false; break; }
                                 for (int pi = 0; pi < pc; pi++) {
                                     int v = (p[pi]<0)?0:p[pi];
                                     if (v==0)  { curFg=C_FG; curBg=C_BG; curBold=false; }
                                     else if (v==1)  curBold=true;
                                     else if (v==22) curBold=false;
-                                    else if (v==7)  { uint16_t t=curFg; curFg=curBg; curBg=t; } // reverse
-                                    else if (v==27) { curFg=C_FG; curBg=C_BG; } // reverse off
+                                    else if (v==7)  { uint16_t t=curFg; curFg=curBg; curBg=t; }
+                                    else if (v==27) { curFg=C_FG; curBg=C_BG; }
                                     else if (v>=30 && v<=37) curFg=ansiCol[v-30+(curBold?8:0)];
                                     else if (v==39) curFg=C_FG;
                                     else if (v>=40 && v<=47) curBg=ansiCol[v-40];
@@ -2031,18 +1921,17 @@ void runSSHTerm(ssh_session sess, ssh_channel ch) {
                     continue;
                 }
 
-                // ESC dispatcher
                 if (inEsc) {
                     inEsc = false;
                     if      (c2 == '[') { inCSI=true; csiLen=0; csiPriv=false; }
                     else if (c2 == ']') { inOSC=true; }
-                    else if (c2 == '7') { savedCx=tcx; savedCy=tcy; }  // save cursor
-                    else if (c2 == '8') {                               // restore cursor
+                    else if (c2 == '7') { savedCx=tcx; savedCy=tcy; }
+                    else if (c2 == '8') {
                         tcx=savedCx; tcy=savedCy;
                         if(tcx>=tCols)tcx=tCols-1;
                         if(tcy>=tRows)tcy=tRows-1;
                     }
-                    else if (c2 == 'M') { // reverse index
+                    else if (c2 == 'M') {
                         if (tcy > scrollTop) tcy--;
                         else scrollRegionDown(1);
                     }
@@ -2051,7 +1940,6 @@ void runSSHTerm(ssh_session sess, ssh_channel ch) {
 
                 if (c2 == 0x1B) { inEsc=true; continue; }
 
-                // C0 controls
                 if (c2 == '\r') { tcx=0; continue; }
                 if (c2 == '\n' || c2 == 0x0B || c2 == 0x0C) {
                     tcy++;
@@ -2069,63 +1957,52 @@ void runSSHTerm(ssh_session sess, ssh_channel ch) {
                     continue;
                 }
                 if (c2 == '\t') {
-                    // Advance to next tab stop (every 8 cols)
                     int next = ((tcx/8)+1)*8;
                     while(tcx < next && tcx < tCols) putChar(' ');
                     continue;
                 }
                 if (c2 < 0x20) continue;
 
-                // UTF-8 multi-byte: absorb continuation bytes and map
-                // box-drawing / block chars to ASCII equivalents
+                // UTF-8: absorb continuation bytes, map box-drawing to ASCII
                 if (c2 >= 0xC0) {
-                    // Start of multi-byte sequence — peek ahead to identify char
-                    // Collect up to 3 continuation bytes
                     uint8_t seq[4] = {c2, 0, 0, 0};
                     int slen = 1;
                     while (slen < 4 && (i+1) < n && (uint8_t)rbuf[i+1] >= 0x80 && (uint8_t)rbuf[i+1] < 0xC0)
                         seq[slen++] = (uint8_t)rbuf[++i];
 
-                    // Decode codepoint
                     uint32_t cp = 0;
                     if      ((seq[0] & 0xE0) == 0xC0) cp = ((seq[0]&0x1F)<<6)  | (seq[1]&0x3F);
                     else if ((seq[0] & 0xF0) == 0xE0) cp = ((seq[0]&0x0F)<<12) | ((seq[1]&0x3F)<<6) | (seq[2]&0x3F);
                     else if ((seq[0] & 0xF8) == 0xF0) cp = ((seq[0]&0x07)<<18) | ((seq[1]&0x3F)<<12) | ((seq[2]&0x3F)<<6) | (seq[3]&0x3F);
 
-                    // Map to ASCII
                     char mapped = '?';
-                    if      (cp == 0x00A0) mapped = ' ';  // non-breaking space
-                    // Box drawing (U+2500..U+257F)
-                    else if (cp >= 0x2500 && cp <= 0x2501) mapped = '-'; // horizontal lines (─━)
-                    else if (cp == 0x2502 || cp == 0x2503) mapped = '|'; // vertical lines (│┃)
-                    else if (cp >= 0x2504 && cp <= 0x250F) mapped = '-'; // misc horizontal
-                    else if (cp >= 0x2510 && cp <= 0x2517) mapped = '+'; // corners
-                    else if (cp >= 0x2518 && cp <= 0x251F) mapped = '+'; // corners
-                    else if (cp >= 0x2520 && cp <= 0x252F) mapped = '+'; // T-junctions
-                    else if (cp >= 0x2530 && cp <= 0x253F) mapped = '+'; // T-junctions
-                    else if (cp >= 0x2540 && cp <= 0x254F) mapped = '+'; // cross
-                    else if (cp >= 0x2550 && cp <= 0x2551) mapped = (cp==0x2551)?'|':'-'; // double lines
-                    else if (cp >= 0x2552 && cp <= 0x256C) mapped = '+'; // double corners/T
-                    else if (cp >= 0x2574 && cp <= 0x257F) mapped = '+'; // light/half
-                    // Block elements (U+2580..U+259F)
+                    if      (cp == 0x00A0) mapped = ' ';
+                    else if (cp >= 0x2500 && cp <= 0x2501) mapped = '-';
+                    else if (cp == 0x2502 || cp == 0x2503) mapped = '|';
+                    else if (cp >= 0x2504 && cp <= 0x250F) mapped = '-';
+                    else if (cp >= 0x2510 && cp <= 0x2517) mapped = '+';
+                    else if (cp >= 0x2518 && cp <= 0x251F) mapped = '+';
+                    else if (cp >= 0x2520 && cp <= 0x252F) mapped = '+';
+                    else if (cp >= 0x2530 && cp <= 0x253F) mapped = '+';
+                    else if (cp >= 0x2540 && cp <= 0x254F) mapped = '+';
+                    else if (cp >= 0x2550 && cp <= 0x2551) mapped = (cp==0x2551)?'|':'-';
+                    else if (cp >= 0x2552 && cp <= 0x256C) mapped = '+';
+                    else if (cp >= 0x2574 && cp <= 0x257F) mapped = '+';
                     else if (cp >= 0x2580 && cp <= 0x259F) mapped = '#';
-                    // Arrows (U+2190..U+21FF)
                     else if (cp == 0x2190) mapped = '<';
                     else if (cp == 0x2192) mapped = '>';
                     else if (cp == 0x2191) mapped = '^';
                     else if (cp == 0x2193) mapped = 'v';
-                    // Common symbols
-                    else if (cp == 0x2022 || cp == 0x25CF) mapped = '*'; // bullet
-                    else if (cp == 0x2026) mapped = '.';  // ellipsis
-                    else if (cp == 0x00B7) mapped = '.';  // middle dot
-                    else if (cp >= 0x2018 && cp <= 0x201F) mapped = '"'; // smart quotes
-                    // If in printable Latin-1 range, use directly
+                    else if (cp == 0x2022 || cp == 0x25CF) mapped = '*';
+                    else if (cp == 0x2026) mapped = '.';
+                    else if (cp == 0x00B7) mapped = '.';
+                    else if (cp >= 0x2018 && cp <= 0x201F) mapped = '"';
                     else if (cp >= 0x20 && cp <= 0xFF) mapped = (char)cp;
 
                     if (mapped != '?') putChar(mapped);
                     continue;
                 }
-                if (c2 >= 0x80) continue; // stray continuation byte, skip
+                if (c2 >= 0x80) continue;
 
                 putChar((char)c2);
             }
@@ -2134,7 +2011,6 @@ void runSSHTerm(ssh_session sess, ssh_channel ch) {
     }
     done:;
 }
-
 
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -2188,10 +2064,10 @@ void setup() {
     touchActivity();
     delay(300);
 
-    // If we restarted to switch WG config, auto-connect to the saved profile
+    // Auto-connect after WG config switch restart
     if (g_bootProfileIdx >= 0) {
         int autoIdx = g_bootProfileIdx;
-        g_bootProfileIdx = -1; // always clear — even if WiFi fails
+        g_bootProfileIdx = -1;
         if (autoIdx < g_profCnt && g_wifiOk) {
             bprint("Resuming...", C_DIM);
             delay(300);
